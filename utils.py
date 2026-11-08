@@ -1,0 +1,230 @@
+"""
+utils.py
+========
+Privacy Masking, Rate Limiting, Voice Command Parser, and Bilingual (Hindi/English) UI Helpers.
+"""
+
+from __future__ import annotations
+import re
+from typing import Any, Dict, List, Optional
+import pandas as pd
+
+
+def mask_sensitive_value(value: Any, col_name: str = "") -> str:
+    """
+    Masks sensitive PII (Aadhaar, Mobile, Bank Account, PAN) so logs, UI previews,
+    and AI prompts never expose raw citizen data.
+    Examples:
+    - Aadhaar (12 digits): XXXXXXXX1234
+    - Mobile (10 digits): XXXXXX7890
+    - Bank Account: XXXXXXXX5678
+    """
+    if value is None:
+        return ""
+    val_str = str(value).strip()
+    if not val_str or val_str.lower() in ("nan", "none", "null"):
+        return ""
+
+    if re.match(r"^\d+\.0$", val_str):
+        val_str = val_str[:-2]
+
+    col_lower = str(col_name).lower()
+    digits_only = re.sub(r"\D", "", val_str)
+
+    if (
+        "aadhaar" in col_lower
+        or "aadhar" in col_lower
+        or "जनाधार" in col_lower
+        or "आधार" in col_lower
+        or len(digits_only) == 12
+    ):
+        if len(digits_only) >= 4:
+            return "X" * (len(digits_only) - 4) + digits_only[-4:]
+
+    if (
+        any(k in col_lower for k in ["mobile", "phone", "contact", "मोबाइल", "फ़ोन", "फोन"])
+        or len(digits_only) == 10
+    ):
+        if len(digits_only) >= 4:
+            return "X" * (len(digits_only) - 4) + digits_only[-4:]
+
+    if any(k in col_lower for k in ["account", "bank", "खाता", "pan"]):
+        if len(val_str) > 4:
+            return "X" * (len(val_str) - 4) + val_str[-4:]
+
+    return val_str
+
+
+def mask_dataframe_for_display(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Returns a copy of `df` where sensitive columns (Aadhaar, Mobile, Bank, PAN)
+    are masked as XXXXXXXX1234 for safe UI display and logging.
+    """
+    if df is None or df.empty:
+        return df
+    masked_df = df.copy()
+    for col in masked_df.columns:
+        col_low = str(col).lower()
+        if any(
+            k in col_low
+            for k in ["aadhaar", "aadhar", "mobile", "phone", "bank", "account", "pan", "आधार", "मोबाइल", "खाता"]
+        ):
+            masked_df[col] = masked_df[col].apply(lambda v: mask_sensitive_value(v, str(col)))
+    return masked_df
+
+
+def sanitize_sample_rows_for_ai(rows: List[Dict[str, Any]]) -> List[Dict[str, str]]:
+    """
+    Takes 1-2 sample rows and masks all sensitive numbers before sending to Gemini for field mapping.
+    Never sends raw Aadhaar, bank account, or mobile numbers.
+    """
+    masked_rows: List[Dict[str, str]] = []
+    for row in rows[:2]:
+        clean_row: Dict[str, str] = {}
+        for col, val in row.items():
+            clean_row[str(col)] = mask_sensitive_value(val, str(col))
+        masked_rows.append(clean_row)
+    return masked_rows
+
+
+def format_value_for_portal(
+    value: Any,
+    transform_rule: Optional[str] = None
+) -> str:
+    """
+    Applies automatic value formatting required by portals:
+    - 'date_ddmmyyyy': converts dates to DD/MM/YYYY
+    - 'date_yyyymmdd': converts dates to YYYY-MM-DD (for HTML <input type="date">)
+    - 'upper': UPPERCASE
+    - 'lower': lowercase
+    - 'title': Proper Case
+    - 'digits_only': strips spaces and dashes
+    """
+    if value is None:
+        return ""
+    val_str = str(value).strip()
+    if val_str.lower() in ["nan", "none", "null"]:
+        return ""
+
+    if re.match(r"^\d+\.0$", val_str):
+        val_str = val_str[:-2]
+
+    if not transform_rule or transform_rule == "none":
+        return val_str
+
+    rule = transform_rule.lower()
+    if rule == "upper":
+        return val_str.upper()
+    elif rule == "lower":
+        return val_str.lower()
+    elif rule == "title":
+        return val_str.title()
+    elif rule == "digits_only":
+        return re.sub(r"\D", "", val_str)
+    elif rule in ["date_ddmmyyyy", "date_yyyymmdd"]:
+        try:
+            dt = pd.to_datetime(val_str, dayfirst=True, errors="coerce")
+            if pd.notna(dt):
+                return dt.strftime("%d/%m/%Y") if rule == "date_ddmmyyyy" else dt.strftime("%Y-%m-%d")
+        except Exception:
+            pass
+
+    return val_str
+
+
+def parse_voice_assistant_command(command_text: str) -> Dict[str, Any]:
+    """
+    Parses Hindi / English / Hinglish voice or text commands across all 4 URL-First modes:
+    - "is URL ko scan karo" / "scan page" -> {"intent": "scan_url"}
+    - "Excel format banao" / "make excel template" -> {"intent": "make_excel_format"}
+    - "pehli 10 rows bharo" / "fill first 10 rows" -> {"intent": "range_rows", "count": 10}
+    - "sirf failed rows dobara chalao" / "retry failed" -> {"intent": "retry_failed"}
+    - "table Excel mein nikalo" / "extract table" -> {"intent": "extract_table"}
+    - "sabka status check karo" / "check all status" -> {"intent": "check_all_status"}
+    - "agli row bharo" / "fill next row" -> {"intent": "next_row"}
+    - "reconcile karo" / "compare data" -> {"intent": "reconcile"}
+    - "pause karo" / "ruko" -> {"intent": "pause"}
+    """
+    cmd = command_text.strip().lower()
+    if not cmd:
+        return {"intent": "unknown", "message_hi": "खाली कमांड", "message_en": "Empty command"}
+
+    if any(p in cmd for p in ["excel format", "format banao", "template banao", "एक्सेल फॉर्मेट", "टेम्पलेट बनाओ"]):
+        return {
+            "intent": "make_excel_format",
+            "message_hi": "वेबसाइट के फॉर्म के अनुसार रेडी-टू-फिल एक्सेल फॉर्मेट (.xlsx) बनाया जा रहा है...",
+            "message_en": "Generating ready-to-fill Excel template (.xlsx) matching the scanned website fields..."
+        }
+
+    if any(p in cmd for p in ["url ko scan", "scan karo", "scan page", "स्कैन करो", "पेज स्कैन"]):
+        return {
+            "intent": "scan_url",
+            "message_hi": "वेब पेज के सभी फॉर्म फील्ड्स, ड्रॉपडाउन, टेबल और अपलोड्स स्कैन किए जा रहे हैं...",
+            "message_en": "Scanning all form fields, dropdown options, tables, and uploads on the URL..."
+        }
+
+    if any(p in cmd for p in ["table excel", "टेबल एक्सेल", "extract table", "table nikalo", "टेबल निकालो"]):
+        return {
+            "intent": "extract_table",
+            "message_hi": "वेब पेज से टेबल निकालकर एक्सेल में सेव की जा रही है...",
+            "message_en": "Extracting HTML table from page into Excel..."
+        }
+
+    if any(p in cmd for p in ["status check", "स्टेटस चेक", "sabka status", "application ka status", "check all status", "स्थिति जांचो"]):
+        return {
+            "intent": "check_all_status",
+            "message_hi": "सभी आवेदन संख्याओं (Application IDs) का स्टेटस वेबसाइट से चेक किया जा रहा है...",
+            "message_en": "Checking application status for all IDs on the portal..."
+        }
+
+    if any(p in cmd for p in ["reconcile", "compare", "मिलान", "अंतर"]):
+        return {
+            "intent": "reconcile",
+            "message_hi": "एक्सेल और वेबसाइट के डेटा का मिलान (Reconcile) किया जा रहा है...",
+            "message_en": "Reconciling Excel data with website records..."
+        }
+
+    if any(p in cmd for p in ["agli row", "next row", "अगली रो", "अगली पंक्ति", "ek row"]):
+        return {
+            "intent": "next_row",
+            "message_hi": "अगली पंक्ति (Row) भरी जा रही है...",
+            "message_en": "Filling next row..."
+        }
+
+    match_num = re.search(r"(\d+)", cmd)
+    if any(p in cmd for p in ["pehli", "first", "प्रथम", "shuru ki", "पहली"]) and match_num:
+        n = int(match_num.group(1))
+        return {
+            "intent": "range_rows",
+            "count": n,
+            "message_hi": f"पहली {n} पंक्तियाँ (Rows) सेलेक्ट की गईं।",
+            "message_en": f"Selected first {n} rows."
+        }
+
+    if any(p in cmd for p in ["failed", "फेल", "dobara", "retry"]):
+        return {
+            "intent": "retry_failed",
+            "message_hi": "केवल फेल हुई पंक्तियों को दोबारा चलाया जा रहा है।",
+            "message_en": "Retrying failed rows only."
+        }
+
+    if any(p in cmd for p in ["photo", "फोटो", "document", "skip", "chhodo", "छोड़ो"]):
+        return {
+            "intent": "skip_row",
+            "value": True,
+            "message_hi": "वर्तमान पंक्ति / फोटो अपलोड स्किप कर दिया गया है।",
+            "message_en": "Current row / photo upload skipped."
+        }
+
+    if any(p in cmd for p in ["pause", "ruk", "रुक", "stop", "रोको", "ruko"]):
+        return {
+            "intent": "pause",
+            "message_hi": "ऑटो-फिलर रोक दिया गया है।",
+            "message_en": "Auto-filler paused."
+        }
+
+    return {
+        "intent": "unknown",
+        "message_hi": f"कमांड समझ नहीं आया: '{command_text}'",
+        "message_en": f"Command not recognized: '{command_text}'"
+    }
