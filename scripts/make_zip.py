@@ -1,7 +1,7 @@
 """
 scripts/make_zip.py
 Packages the complete "URL-First Excel <-> Website Automation Assistant" Python project
-(all 14 Python modules + requirements.txt + README.md + templates/ + samples/)
+(all 14 Python modules + requirements.txt + packages.txt + README.md + templates/ + samples/)
 into public/excel_website_automation_assistant.zip and root excel_website_automation_assistant.zip.
 """
 
@@ -25,6 +25,7 @@ CORE_FILES = [
     "report.py",
     "utils.py",
     "requirements.txt",
+    "packages.txt",
     "README.md",
 ]
 

@@ -5,10 +5,10 @@ URL-First Excel <-> Website Automation Assistant (Streamlit Main Entry Point)
 
 Supports 4 top-level workflow modes via the top Mode Switch:
 1. "Scan & Make Excel Format" (Steps 1 & 2):
-   - Open any website URL in a visible Chromium browser (or scan the current open page after manual Login/OTP/CAPTCHA).
+   - Open any website URL in a visible Chromium browser on Desktop, or seamlessly in Cloud Browser / Direct-Scan mode on Streamlit Community Cloud.
    - Scan EVERYTHING: form fields, dropdown options, cascading dropdowns (District -> Block -> Village), multi-step forms, file uploads, HTML tables, pagination, and detail links.
    - Show "Form fields found: N, Tables found: M, Uploads: K" report.
-   - Gemini cleans up the scan and auto-generates a ready-to-fill 3-sheet Excel template (.xlsx) with DataValidation dropdowns, required highlights, notes row, "Instructions" sheet, and "Allowed Values" sheet.
+   - Gemini cleans up the scan and auto-generates a ready-to-fill 3-sheet Excel template (.xlsx) with DataValidation dropdown lists, required highlights, notes row, "Instructions" sheet, and "Allowed Values" sheet.
    - Option: "I already have my own Excel" — upload it, map columns with Gemini, and reshape it into the generated template format.
 2. "Fill Website from Excel" (Step 3):
    - Import Excel/CSV/Word, choose sheet and row range, pre-validate (mandatory blanks, 10-digit mobile, 12-digit Aadhaar, 6-digit PIN, dates, allowed dropdown values, duplicates).
@@ -25,9 +25,9 @@ import json
 import pandas as pd
 import streamlit as st
 
-from importer import load_spreadsheet_sheets, load_word_document, filter_rows_by_selection
+from importer import load_spreadsheet_sheets, load_word_document
 from validator import validate_dataset
-from browser import PortalBrowserManager
+from browser import PortalBrowserManager, fetch_url_html_direct
 from scanner import scan_full_page_live, scan_full_html_string
 from template_maker import generate_excel_template_from_scan, reshape_user_excel_to_template
 from llm import (
@@ -35,7 +35,6 @@ from llm import (
     get_gemini_model_name,
     clean_and_enrich_scan_with_gemini,
     generate_field_mapping_with_gemini,
-    suggest_extraction_selectors_with_gemini,
     PortalTemplateStore,
 )
 from uploader import match_document_for_row
@@ -52,7 +51,6 @@ from reconcile import reconcile_excel_vs_website, export_reconciliation_excel
 from report import export_results_excel, export_formatted_excel_bytes, generate_pdf_summary_report
 from utils import (
     mask_sensitive_value,
-    mask_dataframe_for_display,
     parse_voice_assistant_command,
 )
 
@@ -91,6 +89,56 @@ if "reconcile_diff_df" not in st.session_state:
 
 template_store = PortalTemplateStore("./templates")
 
+
+def scan_url_or_active_browser(url_to_scan: str, start_from_current: bool = True, scan_multistep: bool = True):
+    """
+    Opens `url_to_scan` in Playwright (or uses Direct HTTP fetch fallback on restricted cloud containers)
+    and returns `(ok, message, scan_report)`.
+    """
+    mgr: PortalBrowserManager = st.session_state.browser_mgr
+
+    if not mgr.page and not mgr.fallback_html:
+        with st.spinner("Launching browser / connecting to URL (auto-installing Chromium if needed)..."):
+            ok, msg = mgr.launch_headed_browser(url_to_scan)
+            if not ok:
+                return False, msg, None
+    elif mgr.page and not start_from_current and url_to_scan:
+        try:
+            mgr.page.goto(url_to_scan, wait_until="domcontentloaded", timeout=60000)
+        except Exception:
+            pass
+    elif not mgr.page and url_to_scan:
+        ok_http, html_or_err, final_u = fetch_url_html_direct(url_to_scan)
+        if ok_http:
+            mgr.fallback_html = html_or_err
+            mgr.fallback_url = final_u
+        else:
+            return False, html_or_err, None
+
+    if mgr.page:
+        report = scan_full_page_live(
+            mgr.page,
+            probe_cascading=True,
+            scan_multi_steps=scan_multistep,
+        )
+    else:
+        report = scan_full_html_string(mgr.fallback_html, source_url=mgr.fallback_url or url_to_scan)
+
+    enriched_fields, ai_msg = clean_and_enrich_scan_with_gemini(report.get("fields", []))
+    report["fields"] = enriched_fields
+    st.session_state.scan_report = report
+    st.session_state.scanned_fields = enriched_fields
+
+    # If the page also contains HTML tables, pre-populate extracted_df with the first table for convenience
+    if report.get("tables") and st.session_state.extracted_df is None:
+        html_src = mgr.page.content() if mgr.page else mgr.fallback_html
+        dfs = detect_html_tables_from_string(html_src)
+        if dfs:
+            st.session_state.extracted_df = clean_extracted_dataframe(dfs[0])
+
+    return True, f"✅ {report['summary_text']} | {ai_msg}", report
+
+
 # ---------------------------------------------------------------------------
 # Sidebar Configuration & Safety Controls
 # ---------------------------------------------------------------------------
@@ -118,7 +166,7 @@ with st.sidebar:
             st.rerun()
 
     st.divider()
-    st.subheader("🌐 Playwright Headed Browser")
+    st.subheader("🌐 Playwright Browser & URL")
     default_demo_path = os.path.abspath("./samples/demo_portal.html")
     default_url = f"file://{default_demo_path}" if os.path.exists(default_demo_path) else "https://sso.rajasthan.gov.in"
     portal_url = st.text_input("Website URL:", value=default_url)
@@ -126,15 +174,22 @@ with st.sidebar:
     col_b1, col_b2 = st.columns(2)
     with col_b1:
         if st.button("🚀 Open URL", use_container_width=True):
-            ok, msg = st.session_state.browser_mgr.launch_headed_browser(portal_url)
+            with st.spinner("Opening URL (auto-installing Chromium on first cloud run)..."):
+                ok, msg = st.session_state.browser_mgr.launch_headed_browser(portal_url)
             if ok:
-                st.toast(msg)
+                st.success(msg)
             else:
                 st.error(msg)
     with col_b2:
         if st.button("🛑 Close Browser", use_container_width=True):
             st.session_state.browser_mgr.close()
             st.toast("Browser closed.")
+
+    # Show live browser preview when running in Cloud Headless Mode (e.g., Streamlit Cloud on Mobile)
+    live_shot = st.session_state.browser_mgr.get_live_screenshot_bytes()
+    if live_shot:
+        with st.expander("🖥️ Live Browser View (Cloud Preview)", expanded=True):
+            st.image(live_shot, caption=st.session_state.browser_mgr.page.url, use_container_width=True)
 
     st.divider()
     st.subheader("🛡️ Safety & Rate Limiting")
@@ -211,11 +266,10 @@ if mode == "Scan & Make Excel Format":
     with col_u1:
         target_scan_url = st.text_input("Website URL to Open & Scan:", value=portal_url)
     with col_u2:
-        start_from_current = st.checkbox("Start from the page I am on now (after Login)", value=True)
+        start_from_current = st.checkbox("Start from the page I am on now (after Login)", value=False)
     with col_u3:
         scan_multistep = st.checkbox("Safe Multi-Step Scan (Never Submits)", value=True)
 
-    # Check if browser is paused on Login/OTP/CAPTCHA
     if st.session_state.browser_mgr.page:
         obstacle = st.session_state.browser_mgr.detect_security_obstacle()
         if obstacle["paused"]:
@@ -225,25 +279,16 @@ if mode == "Scan & Make Excel Format":
 
     col_sc1, col_sc2, col_sc3 = st.columns(3)
     with col_sc1:
-        if st.button("🌐 Open URL & Scan This Page (Live Browser)", type="primary", use_container_width=True):
-            if not st.session_state.browser_mgr.page:
-                ok, msg = st.session_state.browser_mgr.launch_headed_browser(target_scan_url)
-                if not ok:
-                    st.error(msg)
-            elif not start_from_current and target_scan_url:
-                st.session_state.browser_mgr.page.goto(target_scan_url, wait_until="domcontentloaded")
-
-            if st.session_state.browser_mgr.page:
-                report = scan_full_page_live(
-                    st.session_state.browser_mgr.page,
-                    probe_cascading=True,
-                    scan_multi_steps=scan_multistep,
-                )
-                enriched_fields, ai_msg = clean_and_enrich_scan_with_gemini(report["fields"])
-                report["fields"] = enriched_fields
-                st.session_state.scan_report = report
-                st.session_state.scanned_fields = enriched_fields
-                st.success(f"✅ {report['summary_text']} | {ai_msg}")
+        if st.button("🌐 Open URL & Scan This Page", type="primary", use_container_width=True):
+            ok, msg, _ = scan_url_or_active_browser(
+                url_to_scan=target_scan_url,
+                start_from_current=start_from_current,
+                scan_multistep=scan_multistep,
+            )
+            if ok:
+                st.success(msg)
+            else:
+                st.error(msg)
 
     with col_sc2:
         if st.button("🧪 Scan Bundled Local Demo Portal (`demo_portal.html`)", use_container_width=True):
@@ -268,7 +313,6 @@ if mode == "Scan & Make Excel Format":
                     st.session_state.scanned_fields = tpl_obj["scanned_fields"]
                 st.toast(f"Loaded template `{chosen_tpl}`")
 
-    # Display Scan Report & Auto-Generate Excel Format (Step 2)
     if st.session_state.scan_report or st.session_state.scanned_fields:
         rep = st.session_state.scan_report or {
             "fields": st.session_state.scanned_fields,
@@ -277,29 +321,37 @@ if mode == "Scan & Make Excel Format":
             "summary_text": f"Form fields found: {len(st.session_state.scanned_fields)}",
         }
         fields = st.session_state.scanned_fields
+        tables_found = rep.get("tables", [])
 
         st.markdown(f"### 📊 URL Scan Report — `{rep.get('summary_text')}`")
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("Form Fields Found", len(fields))
-        m2.metric("Tables Found", len(rep.get("tables", [])))
+        m2.metric("Tables Found", len(tables_found))
         m3.metric("File Upload Fields", len(rep.get("uploads", [])))
         m4.metric("Dropdown / Radio Fields", sum(1 for f in fields if f.get("options")))
 
-        fields_preview_df = pd.DataFrame([
-            {
-                "Order": i + 1,
-                "Section": f.get("section", "Form"),
-                "Website Field Label": f.get("label", ""),
-                "Excel Column Name": f.get("suggested_column") or f.get("name") or f.get("id"),
-                "Type": f.get("type", "text"),
-                "Required": "Yes *" if f.get("required") else "No",
-                "Validation / Format": f.get("validation_rule", "text"),
-                "Allowed Options (Dropdown/Radio)": ", ".join(f.get("options", [])[:6]),
-                "Selector": f.get("selector", ""),
-            }
-            for i, f in enumerate(fields)
-        ])
-        st.dataframe(fields_preview_df, use_container_width=True)
+        if fields:
+            fields_preview_df = pd.DataFrame([
+                {
+                    "Order": i + 1,
+                    "Section": f.get("section", "Form"),
+                    "Website Field Label": f.get("label", ""),
+                    "Excel Column Name": f.get("suggested_column") or f.get("name") or f.get("id"),
+                    "Type": f.get("type", "text"),
+                    "Required": "Yes *" if f.get("required") else "No",
+                    "Validation / Format": f.get("validation_rule", "text"),
+                    "Allowed Options (Dropdown/Radio)": ", ".join(f.get("options", [])[:6]),
+                    "Selector": f.get("selector", ""),
+                }
+                for i, f in enumerate(fields)
+            ])
+            st.dataframe(fields_preview_df, use_container_width=True)
+
+        if tables_found:
+            with st.expander(f"📋 Detected HTML Tables on Page ({len(tables_found)})", expanded=True):
+                for tbl in tables_found:
+                    st.markdown(f"**Table #{tbl['table_index']}: {tbl['title']}** ({tbl['row_count']} rows)")
+                    st.dataframe(pd.DataFrame(tbl["preview_rows"]), use_container_width=True)
 
         st.divider()
         st.subheader("📥 Step 2: Auto-Generate Ready-to-Fill Excel Format (.xlsx)")
@@ -419,7 +471,6 @@ elif mode == "Fill Website from Excel":
                 sheets = load_spreadsheet_sheets(raw_bytes, fname)
                 sheet_name = st.selectbox("Select Sheet:", list(sheets.keys()))
                 df_loaded = sheets[sheet_name]
-                # Skip hint row if row 0 contains format hint descriptions
                 if not df_loaded.empty and any("Required (" in str(v) or "Optional (" in str(v) for v in df_loaded.iloc[0].values):
                     df_loaded = df_loaded.iloc[1:].reset_index(drop=True)
                 st.session_state.active_df = df_loaded
@@ -430,7 +481,6 @@ elif mode == "Fill Website from Excel":
             edited_df = st.data_editor(df, num_rows="dynamic", use_container_width=True, key="step3_editor")
             st.session_state.active_df = edited_df
 
-            # Build allowed dropdown options map from scanned fields or loaded template
             allowed_opts_map = {}
             for f in st.session_state.scanned_fields:
                 col_key = f.get("suggested_column") or f.get("name")
@@ -509,8 +559,10 @@ elif mode == "Fill Website from Excel":
             with c1:
                 if st.button("✍️ Fill Current Row (Stop Before Submit)", type="primary", use_container_width=True):
                     if not st.session_state.browser_mgr.page:
-                        st.error("Click 'Open URL' in the sidebar first!")
-                    else:
+                        ok, msg = st.session_state.browser_mgr.launch_headed_browser(portal_url)
+                        if not ok or not st.session_state.browser_mgr.page:
+                            st.error("Playwright interactive browser is required for form filling. Run locally or check cloud Chromium packages.")
+                    if st.session_state.browser_mgr.page:
                         fill_res = fill_row_into_portal(
                             page=st.session_state.browser_mgr.page,
                             row_data=current_row,
@@ -616,7 +668,7 @@ elif mode == "Website to Excel":
 
         b1, b2 = st.columns(2)
         with b1:
-            if st.button("🔍 Extract Paginated Table from Live Browser", type="primary", use_container_width=True):
+            if st.button("🔍 Extract Table from Target URL / Browser", type="primary", use_container_width=True):
                 if st.session_state.browser_mgr.page:
                     raw_df = extract_paginated_table_live(
                         page=st.session_state.browser_mgr.page,
@@ -629,7 +681,19 @@ elif mode == "Website to Excel":
                     )
                     st.success(f"Extracted {len(st.session_state.extracted_df)} rows!")
                 else:
-                    st.error("Open the browser first or test with the local demo button.")
+                    # Direct HTTP fallback for cloud deployments
+                    ok_h, html_str, _ = fetch_url_html_direct(portal_url)
+                    if ok_h:
+                        tables = detect_html_tables_from_string(html_str)
+                        if tables:
+                            st.session_state.extracted_df = clean_extracted_dataframe(
+                                tables[0], clean_currency=clean_numbers, standardize_dates=standardize_dates
+                            )
+                            st.success(f"Extracted {len(st.session_state.extracted_df)} rows directly from `{portal_url}`!")
+                        else:
+                            st.warning("No HTML tables found on that URL.")
+                    else:
+                        st.error(html_str)
 
         with b2:
             if st.button("🧪 Extract Table from Local Demo Portal (`demo_portal.html`)", use_container_width=True):
@@ -695,7 +759,9 @@ elif mode == "Website to Excel":
 
             if st.button("🚀 Run Search-and-Fetch Batch", type="primary"):
                 if not st.session_state.browser_mgr.page:
-                    st.error("Please launch the browser first.")
+                    st.session_state.browser_mgr.launch_headed_browser(portal_url)
+                if not st.session_state.browser_mgr.page:
+                    st.error("Interactive browser page is not open.")
                 else:
                     selectors_map = json.loads(result_selectors_json)
                     updated_df = search_and_fetch_from_excel_live(
@@ -726,7 +792,9 @@ elif mode == "Website to Excel":
 
         if st.button("🚀 Extract Detail Pages & Download Linked Files"):
             if not st.session_state.browser_mgr.page:
-                st.error("Please launch the browser first.")
+                st.session_state.browser_mgr.launch_headed_browser(portal_url)
+            if not st.session_state.browser_mgr.page:
+                st.error("Browser page is not open.")
             else:
                 detail_df = extract_detail_pages_live(
                     page=st.session_state.browser_mgr.page,
